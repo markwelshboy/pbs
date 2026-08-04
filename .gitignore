@@ -1,0 +1,13 @@
+# Never commit runtime secrets or machine-local configuration
+*.secret
+*.key
+*.pem
+rclone.conf
+telegram-send.conf
+pbs-protection.env
+expected-backups.json
+
+# Editor/OS files
+*.swp
+*~
+.DS_Store
