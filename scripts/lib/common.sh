@@ -136,11 +136,21 @@ set_datastore_read_only() {
 }
 
 clear_datastore_maintenance() {
+  local mode="${1:-strict}"
   [[ "$MAINTENANCE_SET" -eq 1 ]] || return 0
   log "clearing datastore maintenance mode"
-  proxmox-backup-manager datastore update "$PBS_DATASTORE" \
-    --delete maintenance-mode || true
-  MAINTENANCE_SET=0
+  if proxmox-backup-manager datastore update "$PBS_DATASTORE" \
+      --delete maintenance-mode; then
+    MAINTENANCE_SET=0
+    return 0
+  fi
+
+  if [[ "$mode" == "best-effort" ]]; then
+    warn "failed to clear datastore maintenance mode; manual intervention may be required"
+    return 0
+  fi
+
+  die "failed to clear datastore maintenance mode"
 }
 
 running_relevant_tasks_json() {
