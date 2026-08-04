@@ -22,10 +22,24 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --output) OUTPUT="$2"; shift 2 ;;
-    --max-age-hours) DEFAULT_MAX_AGE_HOURS="$2"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+    --output)
+      [[ $# -ge 2 ]] || { echo 'ERROR: --output requires a path' >&2; exit 2; }
+      OUTPUT="$2"
+      shift 2
+      ;;
+    --max-age-hours)
+      [[ $# -ge 2 ]] || { echo 'ERROR: --max-age-hours requires a value' >&2; exit 2; }
+      DEFAULT_MAX_AGE_HOURS="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n' "$1" >&2
+      exit 2
+      ;;
   esac
 done
 
@@ -37,6 +51,9 @@ require_cmd proxmox-backup-client
 pbs_client_env
 
 DEFAULT_MAX_AGE_HOURS="${DEFAULT_MAX_AGE_HOURS:-${DEFAULT_MAX_AGE_HOURS_CONFIG:-36}}"
+[[ "$DEFAULT_MAX_AGE_HOURS" =~ ^[0-9]+$ ]] \
+  || { echo 'ERROR: max age must be an integer number of hours' >&2; exit 2; }
+
 read -r -a namespaces <<<"${PBS_NAMESPACES:-r630 nuc-pve beelink-pve mini-pve}"
 
 CURRENT_STAGE="discover"
@@ -46,12 +63,16 @@ result='{"reviewed":false,"default_max_age_hours":'"${DEFAULT_MAX_AGE_HOURS}"',"
 
 for ns in "${namespaces[@]}"; do
   log "reading namespace ${ns}"
-  snapshots="$(
-    proxmox-backup-client snapshot list \
+
+  if ! groups_json="$(
+    proxmox-backup-client list \
       --repository "$PBS_REPOSITORY" \
       --ns "$ns" \
       --output-format json
-  )"
+  )"; then
+    echo "ERROR: failed to list backup groups in namespace: $ns" >&2
+    exit 1
+  fi
 
   groups="$(
     jq '[
@@ -62,8 +83,11 @@ for ns in "${namespaces[@]}"; do
         }
       | select(.type != "" and .id != "")
       | (.type + "/" + .id)
-    ] | unique | sort' <<<"$snapshots"
+    ] | unique | sort' <<<"$groups_json"
   )"
+
+  count="$(jq 'length' <<<"$groups")"
+  log "namespace ${ns}: discovered ${count} backup group(s)"
 
   result="$(
     jq --arg ns "$ns" --argjson groups "$groups" \
