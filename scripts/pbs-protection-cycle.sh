@@ -42,7 +42,7 @@ chmod 0600 "$CURRENT_LOG"
 
 on_exit() {
   local rc=$?
-  clear_datastore_maintenance
+  clear_datastore_maintenance best-effort
 
   if [[ "$rc" -ne 0 ]]; then
     local failed_json="${STATE_DIR}/last-attempt.json"
@@ -166,7 +166,7 @@ check_kernel_storage_errors() {
   since_epoch="$(jq -r '.completed_epoch // empty' "${STATE_DIR}/last-success.json" 2>/dev/null || true)"
   [[ "$since_epoch" =~ ^[0-9]+$ ]] || since_epoch="$(( $(epoch_now) - ${KERNEL_ERROR_LOOKBACK_HOURS:-36} * 3600 ))"
 
-  pattern='I/O error|Buffer I/O|blk_update_request|EXT4-fs error|medium error|uncorrected|mpt[23]sas.*(reset|fault|timeout)|scsi.*(abort|timeout|offline)|sas.*timeout'
+  pattern='I/O error|Buffer I/O|blk_update_request|EXT4-fs (error|warning)|medium error|uncorrected|mpt[23]sas.*(fault|timeout|failed|abort)|scsi.*(abort|timeout|offline)|sas.*timeout'
   matches="$(journalctl -k --since "@${since_epoch}" --no-pager 2>/dev/null | grep -Eai "$pattern" || true)"
   if [[ -n "$matches" ]]; then
     printf '%s\n' "$matches" >>"$CURRENT_LOG"
