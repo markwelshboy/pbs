@@ -1,0 +1,28 @@
+{
+  "reviewed": false,
+  "default_max_age_hours": 36,
+  "namespaces": {
+    "r630": {
+      "required_groups": [
+        "host/hostconfig-r630"
+      ]
+    },
+    "nuc-pve": {
+      "required_groups": [
+        "host/hostconfig-nuc-pve",
+        "vm/431",
+        "vm/432"
+      ]
+    },
+    "beelink-pve": {
+      "required_groups": [
+        "host/hostconfig-beelink-pve"
+      ]
+    },
+    "mini-pve": {
+      "required_groups": [
+        "host/hostconfig-mini-pve"
+      ]
+    }
+  }
+}
