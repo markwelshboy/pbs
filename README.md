@@ -33,7 +33,7 @@ rclone/Telegram locations.
 ```bash
 git clone https://github.com/markwelshboy/pbs.git
 cd pbs
-sudo ./install.sh --install-deps
+sudo bash ./install.sh --install-deps
 ```
 
 The installer creates a dedicated `pbs-protection@pbs!reader` audit token, two
@@ -45,7 +45,7 @@ configuration. It leaves timers disabled.
 ```bash
 git clone https://github.com/markwelshboy/pbs.git
 cd pbs
-./deploy.sh pbs-mini-direct --install-deps
+bash ./deploy.sh pbs-mini-direct --install-deps
 ```
 
 ## First rollout
