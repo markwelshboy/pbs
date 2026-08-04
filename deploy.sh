@@ -7,12 +7,12 @@ declare -a INSTALL_ARGS=()
 
 usage() {
   cat <<'USAGE'
-Usage: ./deploy.sh [target] [installer options]
+Usage: bash ./deploy.sh [target] [installer options]
 
 Examples:
-  ./deploy.sh pbs-mini-direct
-  ./deploy.sh pbs-mini-direct --install-deps
-  ./deploy.sh pbs-mini-direct --disable-legacy --enable
+  bash ./deploy.sh pbs-mini-direct
+  bash ./deploy.sh pbs-mini-direct --install-deps
+  bash ./deploy.sh pbs-mini-direct --disable-legacy --enable
 
 The local working tree is streamed to /tmp on the target, then install.sh runs
 there. Private configuration and credentials are never copied from the repo.
@@ -51,4 +51,4 @@ for arg in "${INSTALL_ARGS[@]}"; do
 done
 
 ssh -t "$TARGET" \
-  "cd '$REMOTE_DIR' && ./install.sh${quoted_args}; rc=\$?; rm -rf '$REMOTE_DIR'; exit \$rc"
+  "cd '$REMOTE_DIR' && bash ./install.sh${quoted_args}; rc=\$?; rm -rf '$REMOTE_DIR'; exit \$rc"
