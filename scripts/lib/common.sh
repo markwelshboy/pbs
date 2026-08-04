@@ -35,7 +35,10 @@ epoch_now() { date +%s; }
 log() {
   local line="[$(date '+%F %T')] [$CURRENT_STAGE] $*"
   printf '%s\n' "$line"
-  [[ -n "$CURRENT_LOG" ]] && printf '%s\n' "$line" >>"$CURRENT_LOG"
+  if [[ -n "$CURRENT_LOG" ]]; then
+    printf '%s\n' "$line" >>"$CURRENT_LOG"
+  fi
+  return 0
 }
 
 warn() {
