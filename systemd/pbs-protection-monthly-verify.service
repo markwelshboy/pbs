@@ -1,0 +1,15 @@
+[Unit]
+Description=Full monthly PBS datastore verification
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pbs-protection/pbs-protection.env
+
+[Service]
+Type=oneshot
+User=root
+Environment=CONFIG_FILE=/etc/pbs-protection/pbs-protection.env
+ExecStart=/usr/local/sbin/pbs-protection-monthly-verify
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=infinity
