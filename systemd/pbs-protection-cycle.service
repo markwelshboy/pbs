@@ -1,0 +1,18 @@
+[Unit]
+Description=Verify and promote PBS datastore to NAS and S3
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pbs-protection/pbs-protection.env
+
+[Service]
+Type=oneshot
+User=root
+Environment=CONFIG_FILE=/etc/pbs-protection/pbs-protection.env
+ExecStart=/usr/local/sbin/pbs-protection-cycle
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
