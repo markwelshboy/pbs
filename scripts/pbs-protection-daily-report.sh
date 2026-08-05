@@ -38,8 +38,8 @@ declare -a HOSTCFG_HOSTS=()
 declare -A WORKLOAD_HOST_SEEN=()
 declare -A HOSTCFG_HOST_SEEN=()
 declare -A MATRIX_EXPECTED=()
-declare -A MATRIX_FOUND=()
-declare -A MATRIX_VERIFIED=()
+declare -A MATRIX_SUCCESS=()
+declare -A MATRIX_FAILED=()
 
 DAY_DATES=(
   "$(date +%F)"
@@ -88,27 +88,63 @@ snapshot_json() {
     --output-format json
 }
 
+# PBS task rows vary slightly between releases. Search all scalar task fields for
+# the namespace/group and return the newest explicit failed backup/verify task on
+# the requested local calendar day. A later successful snapshot overrides an
+# earlier failure for the same group/day.
+failed_task_epoch_for_group_day() {
+  local ns="$1" group="$2" day="$3"
+  local group_type="${group%%/*}"
+  local group_id="${group#*/}"
+
+  jq -r \
+    --arg ns "${ns,,}" \
+    --arg group "${group,,}" \
+    --arg group_colon "${group_type,,}:${group_id,,}" \
+    --arg group_id "${group_id,,}" \
+    --arg day "$day" '
+      [ .[]
+        | . as $task
+        | (($task.endtime // $task["end-time"] // $task.starttime // 0) | tonumber? // 0) as $epoch
+        | (($task.status // "") | tostring) as $status
+        | (($task | tostring) | ascii_downcase) as $text
+        | select($epoch > 0)
+        | select(($epoch | strflocaltime("%Y-%m-%d")) == $day)
+        | select(($status | ascii_upcase) != "OK")
+        | select(($status | ascii_downcase) != "unknown")
+        | select($status != "")
+        | select($text | test("backup|verify"))
+        | select(
+            ($text | contains($group))
+            or ($text | contains($group_colon))
+            or (($text | contains($group_id)) and ($text | contains($ns)))
+          )
+        | $epoch
+      ] | max // 0
+    ' <<<"$TASKS_JSON"
+}
+
 matrix_cell() {
   local category="$1" ns="$2" offset="$3"
-  local expected found verified icon
+  local expected success failed icon
   expected="${MATRIX_EXPECTED["${category}|${ns}"]:-0}"
-  found="${MATRIX_FOUND["${category}|${ns}|${offset}"]:-0}"
-  verified="${MATRIX_VERIFIED["${category}|${ns}|${offset}"]:-0}"
+  success="${MATRIX_SUCCESS["${category}|${ns}|${offset}"]:-0}"
+  failed="${MATRIX_FAILED["${category}|${ns}|${offset}"]:-0}"
 
   if (( expected == 0 )); then
     printf -- '-'
     return 0
   fi
 
-  if (( found == expected && verified == expected )); then
-    icon='✅'
-  elif (( found == 0 )); then
+  if (( failed > 0 )); then
     icon='❌'
+  elif (( success == expected )); then
+    icon='✅'
   else
     icon='⚠️'
   fi
 
-  printf '%d/%d%s' "$found" "$expected" "$icon"
+  printf '%d/%d%s' "$success" "$expected" "$icon"
 }
 
 build_matrix() {
@@ -125,6 +161,15 @@ build_matrix() {
       "$(matrix_cell "$category" "$ns" 2)"
   done
 }
+
+# Fetch enough task history to classify explicit backup/verification failures
+# across the three-day matrix and to produce the global failed-task count.
+TASKS_JSON="$(
+  proxmox-backup-manager task list \
+    --all true \
+    --limit 1000 \
+    --output-format json 2>/dev/null || echo '[]'
+)"
 
 PROMOTION_SUMMARY="missing"
 PROMOTION_SHORT="missing"
@@ -194,38 +239,56 @@ while IFS=$'\t' read -r ns group policy_age; do
   if ! JS="$(snapshot_json "$ns" "$group" 2>/dev/null)"; then
     GROUP_LINES+=("FAIL  [$ns] $group — cannot list snapshots")
     mark_failure "cannot list [$ns]:$group"
+    for offset in 0 1 2; do
+      failed_key="${category}|${ns}|${offset}"
+      MATRIX_FAILED["$failed_key"]=$(( ${MATRIX_FAILED["$failed_key"]:-0} + 1 ))
+    done
     continue
   fi
 
   for offset in 0 1 2; do
-    DAY_STATE="$(jq -r --arg day "${DAY_DATES[$offset]}" '
-      [ .[]
-        | {
-            epoch: (."backup-time" // .backup_time // 0),
-            state: ((.verification.state // .verification_state // "missing") | ascii_downcase)
-          }
-        | select(.epoch > 0)
-        | . + {local_day: (.epoch | strflocaltime("%Y-%m-%d"))}
-        | select(.local_day == $day)
-      ] as $snapshots
-      | if ($snapshots | length) == 0 then "missing"
-        elif any($snapshots[]; .state == "ok") then "ok"
-        else "unverified"
-        end' <<<"$JS")"
+    IFS=$'\t' read -r DAY_EPOCH DAY_VERIFY_STATE < <(
+      jq -r --arg day "${DAY_DATES[$offset]}" '
+        [ .[]
+          | {
+              epoch: (."backup-time" // .backup_time // 0),
+              state: ((.verification.state // .verification_state // "missing") | ascii_downcase)
+            }
+          | select(.epoch > 0)
+          | . + {local_day: (.epoch | strflocaltime("%Y-%m-%d"))}
+          | select(.local_day == $day)
+        ]
+        | sort_by(.epoch)
+        | (last // {epoch:0,state:"missing"})
+        | [.epoch, .state]
+        | @tsv
+      ' <<<"$JS"
+    )
 
-    if [[ "$DAY_STATE" != "missing" ]]; then
-      found_key="${category}|${ns}|${offset}"
-      MATRIX_FOUND["$found_key"]=$(( ${MATRIX_FOUND["$found_key"]:-0} + 1 ))
-      if [[ "$DAY_STATE" == "ok" ]]; then
-        MATRIX_VERIFIED["$found_key"]=$(( ${MATRIX_VERIFIED["$found_key"]:-0} + 1 ))
-      fi
+    DAY_EPOCH="${DAY_EPOCH:-0}"
+    DAY_VERIFY_STATE="${DAY_VERIFY_STATE:-missing}"
+    FAILED_TASK_EPOCH="$(failed_task_epoch_for_group_day "$ns" "$group" "${DAY_DATES[$offset]}")"
+    FAILED_TASK_EPOCH="${FAILED_TASK_EPOCH:-0}"
+
+    cell_key="${category}|${ns}|${offset}"
+
+    if (( FAILED_TASK_EPOCH > DAY_EPOCH )); then
+      MATRIX_FAILED["$cell_key"]=$(( ${MATRIX_FAILED["$cell_key"]:-0} + 1 ))
+    elif (( DAY_EPOCH == 0 )); then
+      : # Missing/not run is amber unless an explicit failed task was found.
+    elif [[ "$DAY_VERIFY_STATE" == "ok" ]]; then
+      MATRIX_SUCCESS["$cell_key"]=$(( ${MATRIX_SUCCESS["$cell_key"]:-0} + 1 ))
+    elif [[ "$DAY_VERIFY_STATE" =~ (fail|error|corrupt) ]]; then
+      MATRIX_FAILED["$cell_key"]=$(( ${MATRIX_FAILED["$cell_key"]:-0} + 1 ))
+    else
+      : # Snapshot exists but verification is pending/missing/unknown: amber.
     fi
   done
 
   LATEST="$(jq '[.[] | (."backup-time" // .backup_time // 0)] | max // 0' <<<"$JS")"
   if [[ "$LATEST" -eq 0 ]]; then
-    GROUP_LINES+=("FAIL  [$ns] $group — no snapshots")
-    mark_failure "no snapshots for [$ns]:$group"
+    GROUP_LINES+=("WARN  [$ns] $group — no snapshots yet")
+    mark_warning "no snapshots yet for [$ns]:$group"
     continue
   fi
 
@@ -233,7 +296,8 @@ while IFS=$'\t' read -r ns group policy_age; do
   VERIFICATION="$(jq -r --argjson latest "$LATEST" '
     [.[] | select((."backup-time" // .backup_time // 0) == $latest)][0]
     | (.verification.state // .verification_state // "missing")
-    | ascii_downcase' <<<"$JS")"
+    | ascii_downcase
+  ' <<<"$JS")"
 
   LINE_STATE="OK"
   if (( AGE_HOURS > FAIL_AGE_HOURS || AGE_HOURS > policy_age )); then
@@ -244,9 +308,14 @@ while IFS=$'\t' read -r ns group policy_age; do
     mark_warning "aging backup [$ns]:$group age=$(age_text "$AGE_HOURS")"
   fi
 
-  if [[ "$VERIFICATION" != "ok" ]]; then
+  if [[ "$VERIFICATION" == "ok" ]]; then
+    :
+  elif [[ "$VERIFICATION" =~ (fail|error|corrupt) ]]; then
     LINE_STATE="FAIL"
-    mark_failure "latest snapshot not verified OK [$ns]:$group state=${VERIFICATION}"
+    mark_failure "latest snapshot verification failed [$ns]:$group state=${VERIFICATION}"
+  else
+    [[ "$LINE_STATE" == "FAIL" ]] || LINE_STATE="WARN"
+    mark_warning "latest snapshot verification pending [$ns]:$group state=${VERIFICATION}"
   fi
 
   GROUP_LINES+=("$(printf '%-5s [%s] %-30s age=%-6s verified=%s' "$LINE_STATE" "$ns" "$group" "$(age_text "$AGE_HOURS")" "$VERIFICATION")")
@@ -260,9 +329,12 @@ done < <(
       then [$ns, ., $ns_age]
       else [$ns, .group, (.max_age_hours // $ns_age)]
       end
-    | @tsv' "$EXPECTED_BACKUPS_FILE"
+    | @tsv
+  ' "$EXPECTED_BACKUPS_FILE"
 )
 
+# Reduce each host/category/day set by severity: any explicit failure is red;
+# otherwise incomplete/pending is amber; only all verified-successful is green.
 for category in workload hostcfg; do
   if [[ "$category" == "workload" ]]; then
     matrix_hosts=("${WORKLOAD_HOSTS[@]}")
@@ -275,12 +347,12 @@ for category in workload hostcfg; do
   for ns in "${matrix_hosts[@]}"; do
     expected="${MATRIX_EXPECTED["${category}|${ns}"]:-0}"
     for offset in 0 1 2; do
-      found="${MATRIX_FOUND["${category}|${ns}|${offset}"]:-0}"
-      verified="${MATRIX_VERIFIED["${category}|${ns}|${offset}"]:-0}"
-      if (( found < expected )); then
-        mark_warning "${category_label} coverage [$ns] ${DAY_DATES[$offset]}=${found}/${expected}"
-      elif (( verified < expected )); then
-        mark_warning "${category_label} verification [$ns] ${DAY_DATES[$offset]}=${verified}/${expected}"
+      success="${MATRIX_SUCCESS["${category}|${ns}|${offset}"]:-0}"
+      failed="${MATRIX_FAILED["${category}|${ns}|${offset}"]:-0}"
+      if (( failed > 0 )); then
+        mark_failure "${category_label} failure [$ns] ${DAY_DATES[$offset]} success=${success}/${expected}, failed=${failed}"
+      elif (( success < expected )); then
+        mark_warning "${category_label} pending/missing [$ns] ${DAY_DATES[$offset]}=${success}/${expected}"
       fi
     done
   done
@@ -313,7 +385,10 @@ done
 
 DF_LINE="$(df -B1 --output=size,used,avail,pcent "$PBS_DATASTORE_PATH" 2>/dev/null | tail -n1 | xargs)"
 read -r FS_SIZE FS_USED FS_AVAIL FS_PCT <<<"$DF_LINE"
-FS_SIZE="${FS_SIZE:-0}"; FS_USED="${FS_USED:-0}"; FS_AVAIL="${FS_AVAIL:-0}"; FS_PCT="${FS_PCT:-unknown}"
+FS_SIZE="${FS_SIZE:-0}"
+FS_USED="${FS_USED:-0}"
+FS_AVAIL="${FS_AVAIL:-0}"
+FS_PCT="${FS_PCT:-unknown}"
 
 SMART_OUTPUT="$(smartctl -a "$SMART_DEVICE" 2>/dev/null || true)"
 SMART_HEALTH="$(awk -F: '/SMART Health Status|SMART overall-health/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' <<<"$SMART_OUTPUT")"
@@ -338,7 +413,8 @@ if NAS_SIZE_JSON="$(timeout "$RCLONE_SIZE_TIMEOUT_SEC" rclone size "$NAS_DEST" -
   NAS_COUNT="$(jq -r '.count // 0' <<<"$NAS_SIZE_JSON")"
   NAS_BYTES="$(jq -r '.bytes // 0' <<<"$NAS_SIZE_JSON")"
 else
-  NAS_COUNT="unknown"; NAS_BYTES="unknown"
+  NAS_COUNT="unknown"
+  NAS_BYTES="unknown"
   mark_failure "could not size NAS mirror within timeout"
 fi
 
@@ -346,7 +422,8 @@ if S3_SIZE_JSON="$(timeout "$RCLONE_SIZE_TIMEOUT_SEC" rclone --config "$RCLONE_C
   S3_COUNT="$(jq -r '.count // 0' <<<"$S3_SIZE_JSON")"
   S3_BYTES="$(jq -r '.bytes // 0' <<<"$S3_SIZE_JSON")"
 else
-  S3_COUNT="unknown"; S3_BYTES="unknown"
+  S3_COUNT="unknown"
+  S3_BYTES="unknown"
   mark_failure "could not size S3 mirror within timeout"
 fi
 
@@ -359,12 +436,14 @@ if [[ "$NAS_COUNT" != "unknown" && "$S3_COUNT" != "unknown" ]]; then
   fi
 fi
 
-TASKS_JSON="$(proxmox-backup-manager task list --all true --limit 100 --output-format json 2>/dev/null || echo '[]')"
-RECENT_FAILED_TASKS="$(jq --argjson cutoff "$((NOW - 36 * 3600))" '[.[] | select(
-  ((.endtime // ."end-time" // 0) >= $cutoff)
-  and ((.status // "") != "OK")
-  and ((.status // "") != "unknown")
-)] | length' <<<"$TASKS_JSON" 2>/dev/null || echo 0)"
+RECENT_FAILED_TASKS="$(
+  jq --argjson cutoff "$((NOW - 36 * 3600))" '[.[] | select(
+    ((.endtime // .["end-time"] // 0) >= $cutoff)
+    and ((.status // "") != "OK")
+    and ((.status // "") != "unknown")
+    and ((.status // "") != "")
+  )] | length' <<<"$TASKS_JSON" 2>/dev/null || echo 0
+)"
 if [[ "$RECENT_FAILED_TASKS" =~ ^[0-9]+$ && "$RECENT_FAILED_TASKS" -gt 0 ]]; then
   mark_warning "$RECENT_FAILED_TASKS failed PBS task(s) in the last 36 hours"
 fi
