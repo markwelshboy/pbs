@@ -69,6 +69,9 @@ install -o root -g root -m 0750 \
   "$ROOT_DIR/scripts/pbs-protection-status.sh" \
   /usr/local/sbin/pbs-protection-status
 install -o root -g root -m 0750 \
+  "$ROOT_DIR/scripts/pbs-protection-daily-report.sh" \
+  /usr/local/sbin/pbs-protection-daily-report
+install -o root -g root -m 0750 \
   "$ROOT_DIR/scripts/pbs-protection-config-archive.sh" \
   /usr/local/sbin/pbs-protection-config-archive
 
@@ -201,6 +204,7 @@ if [[ "$ENABLE" == "1" ]]; then
   /usr/local/sbin/pbs-protection-cycle --check
   systemctl enable --now pbs-protection-cycle.timer
   systemctl enable --now pbs-protection-monthly-verify.timer
+  systemctl enable --now pbs-protection-daily-report.timer
   echo 'Enabled PBS protection timers.'
 else
   echo
