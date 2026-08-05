@@ -176,6 +176,7 @@ PROMOTION_SHORT="missing"
 PROMOTION_CYCLE="unknown"
 PROMOTION_AGE_HOURS=0
 PROMOTION_LOG=""
+PROMOTION_ICON='❌'
 CYCLE_ELAPSED="unknown"
 if [[ -r "${STATE_DIR}/last-success.json" ]]; then
   PROMOTION_EPOCH="$(jq -r '.completed_epoch // 0' "${STATE_DIR}/last-success.json")"
@@ -186,9 +187,13 @@ if [[ -r "${STATE_DIR}/last-success.json" ]]; then
     PROMOTION_SUMMARY="cycle=${PROMOTION_CYCLE}, age=$(age_text "$PROMOTION_AGE_HOURS"), completed=$(local_time_from_epoch "$PROMOTION_EPOCH")"
     PROMOTION_SHORT="$(date -d "@${PROMOTION_EPOCH}" '+%H:%M') ($(age_text "$PROMOTION_AGE_HOURS") old)"
     if (( PROMOTION_AGE_HOURS > PROMOTION_FAIL_HOURS )); then
+      PROMOTION_ICON='❌'
       mark_failure "last successful promotion is $(age_text "$PROMOTION_AGE_HOURS") old"
     elif (( PROMOTION_AGE_HOURS > PROMOTION_WARN_HOURS )); then
+      PROMOTION_ICON='⚠️'
       mark_warning "last successful promotion is $(age_text "$PROMOTION_AGE_HOURS") old"
+    else
+      PROMOTION_ICON='✅'
     fi
   else
     mark_failure "last-success.json has no valid completion time"
@@ -560,7 +565,7 @@ ${STATUS_ICON} <b>PBS Daily — $(html_escape "$OVERALL")</b>
 🖥 <code>$(html_escape "$(hostname -s)")</code>  🗄 <code>$(html_escape "$PBS_DATASTORE")</code>
 
 <b>At a glance</b>
-Promotion: ${STATUS_ICON} <b>$(html_escape "$PROMOTION_SHORT")</b>
+Promotion: ${PROMOTION_ICON} <b>$(html_escape "$PROMOTION_SHORT")</b>
 Mirrors: ${MIRROR_ICON} <b>$(html_escape "$NAS_HUMAN") / $(html_escape "$NAS_COUNT") objects</b>
 Storage: <b>$(html_escape "$FS_PCT") used</b> · $(html_escape "$(human_bytes "$FS_AVAIL")") free
 Disk: ${SMART_ICON} <b>$(html_escape "${SMART_HEALTH:-unknown}")</b> · $(html_escape "${SMART_TEMP:-unknown}")C
