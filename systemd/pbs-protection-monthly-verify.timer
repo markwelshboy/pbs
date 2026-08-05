@@ -2,7 +2,7 @@
 Description=Monthly full PBS verification
 
 [Timer]
-OnCalendar=Sun *-*-01..07 02:30:00
+OnCalendar=Sun *-*-01..07 21:00:00
 Persistent=true
 RandomizedDelaySec=10m
 Unit=pbs-protection-monthly-verify.service
