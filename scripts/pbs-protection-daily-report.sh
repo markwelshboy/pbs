@@ -10,7 +10,7 @@ source "$COMMON_LIB"
 load_config
 ensure_runtime_dirs
 require_root
-for cmd in jq timeout df findmnt smartctl systemctl proxmox-backup-manager proxmox-backup-client rclone openssl; do
+for cmd in jq timeout df smartctl systemctl proxmox-backup-manager proxmox-backup-client rclone openssl; do
   require_cmd "$cmd"
 done
 pbs_client_env
@@ -24,7 +24,7 @@ REPORT_KEEP_DAYS="${DAILY_REPORT_KEEP_DAYS:-90}"
 WARN_AGE_HOURS="${DAILY_REPORT_WARN_AGE_HOURS:-26}"
 FAIL_AGE_HOURS="${DAILY_REPORT_FAIL_AGE_HOURS:-36}"
 PROMOTION_WARN_HOURS="${DAILY_REPORT_PROMOTION_WARN_HOURS:-26}"
-PROMOTION_FAIL_HOURS="${DAILY_REPORT_PROMOTION_FAIL_HOURS:-36}"
+PROMOTION_FAIL_HOURS="${DAILY_REPORT_PROMOTION_FAIL_AGE_HOURS:-${DAILY_REPORT_PROMOTION_FAIL_HOURS:-36}}"
 RCLONE_SIZE_TIMEOUT_SEC="${DAILY_REPORT_RCLONE_TIMEOUT_SEC:-1800}"
 
 install -d -o root -g root -m 0700 "$REPORT_DIR"
@@ -33,6 +33,19 @@ OVERALL="HEALTHY"
 declare -a WARNINGS=()
 declare -a FAILURES=()
 declare -a GROUP_LINES=()
+declare -a WORKLOAD_HOSTS=()
+declare -a HOSTCFG_HOSTS=()
+declare -A WORKLOAD_HOST_SEEN=()
+declare -A HOSTCFG_HOST_SEEN=()
+declare -A MATRIX_EXPECTED=()
+declare -A MATRIX_FOUND=()
+declare -A MATRIX_VERIFIED=()
+
+DAY_DATES=(
+  "$(date +%F)"
+  "$(date -d '1 day ago' +%F)"
+  "$(date -d '2 days ago' +%F)"
+)
 
 mark_warning() {
   [[ "$OVERALL" == "FAILED" ]] || OVERALL="WARNING"
@@ -62,6 +75,11 @@ local_time_from_epoch() {
   fi
 }
 
+short_host() {
+  local host="${1%-pve}"
+  printf '%.9s' "$host"
+}
+
 snapshot_json() {
   local ns="$1" group="$2"
   proxmox-backup-client snapshot list "$group" \
@@ -70,13 +88,58 @@ snapshot_json() {
     --output-format json
 }
 
+matrix_cell() {
+  local category="$1" ns="$2" offset="$3"
+  local expected found verified icon
+  expected="${MATRIX_EXPECTED["${category}|${ns}"]:-0}"
+  found="${MATRIX_FOUND["${category}|${ns}|${offset}"]:-0}"
+  verified="${MATRIX_VERIFIED["${category}|${ns}|${offset}"]:-0}"
+
+  if (( expected == 0 )); then
+    printf -- '-'
+    return 0
+  fi
+
+  if (( found == expected && verified == expected )); then
+    icon='✅'
+  elif (( found == 0 )); then
+    icon='❌'
+  else
+    icon='⚠️'
+  fi
+
+  printf '%d/%d%s' "$found" "$expected" "$icon"
+}
+
+build_matrix() {
+  local category="$1"
+  shift
+  local ns
+
+  printf '%-9s %-7s %-7s %-7s\n' 'host' 'today' '-1d' '-2d'
+  for ns in "$@"; do
+    printf '%-9s %-7s %-7s %-7s\n' \
+      "$(short_host "$ns")" \
+      "$(matrix_cell "$category" "$ns" 0)" \
+      "$(matrix_cell "$category" "$ns" 1)" \
+      "$(matrix_cell "$category" "$ns" 2)"
+  done
+}
+
 PROMOTION_SUMMARY="missing"
+PROMOTION_SHORT="missing"
+PROMOTION_CYCLE="unknown"
+PROMOTION_AGE_HOURS=0
+PROMOTION_LOG=""
+CYCLE_ELAPSED="unknown"
 if [[ -r "${STATE_DIR}/last-success.json" ]]; then
   PROMOTION_EPOCH="$(jq -r '.completed_epoch // 0' "${STATE_DIR}/last-success.json")"
   PROMOTION_CYCLE="$(jq -r '.cycle // "unknown"' "${STATE_DIR}/last-success.json")"
+  PROMOTION_LOG="$(jq -r '.log // empty' "${STATE_DIR}/last-success.json")"
   if [[ "$PROMOTION_EPOCH" =~ ^[0-9]+$ && "$PROMOTION_EPOCH" -gt 0 ]]; then
     PROMOTION_AGE_HOURS=$(( (NOW - PROMOTION_EPOCH) / 3600 ))
     PROMOTION_SUMMARY="cycle=${PROMOTION_CYCLE}, age=$(age_text "$PROMOTION_AGE_HOURS"), completed=$(local_time_from_epoch "$PROMOTION_EPOCH")"
+    PROMOTION_SHORT="$(date -d "@${PROMOTION_EPOCH}" '+%H:%M') ($(age_text "$PROMOTION_AGE_HOURS") old)"
     if (( PROMOTION_AGE_HOURS > PROMOTION_FAIL_HOURS )); then
       mark_failure "last successful promotion is $(age_text "$PROMOTION_AGE_HOURS") old"
     elif (( PROMOTION_AGE_HOURS > PROMOTION_WARN_HOURS )); then
@@ -87,6 +150,16 @@ if [[ -r "${STATE_DIR}/last-success.json" ]]; then
   fi
 else
   mark_failure "no successful promotion marker exists"
+fi
+
+if [[ -r "$PROMOTION_LOG" ]]; then
+  CYCLE_ELAPSED="$(
+    grep -E '\[complete\].*PBS protection cycle completed in [0-9]+:[0-9]+:[0-9]+' "$PROMOTION_LOG" \
+      | tail -n 1 \
+      | sed -E 's/.*completed in ([0-9]+:[0-9]+:[0-9]+).*/\1/' \
+      || true
+  )"
+  [[ -n "$CYCLE_ELAPSED" ]] || CYCLE_ELAPSED="unknown"
 fi
 
 if [[ -r "${STATE_DIR}/last-attempt.json" ]]; then
@@ -101,11 +174,53 @@ while IFS=$'\t' read -r ns group policy_age; do
   [[ -n "$ns" && -n "$group" ]] || continue
   policy_age="${policy_age:-$DEFAULT_AGE}"
 
+  if [[ "$group" == host/* ]]; then
+    category="hostcfg"
+    if [[ -z "${HOSTCFG_HOST_SEEN[$ns]:-}" ]]; then
+      HOSTCFG_HOSTS+=("$ns")
+      HOSTCFG_HOST_SEEN["$ns"]=1
+    fi
+  else
+    category="workload"
+    if [[ -z "${WORKLOAD_HOST_SEEN[$ns]:-}" ]]; then
+      WORKLOAD_HOSTS+=("$ns")
+      WORKLOAD_HOST_SEEN["$ns"]=1
+    fi
+  fi
+
+  expected_key="${category}|${ns}"
+  MATRIX_EXPECTED["$expected_key"]=$(( ${MATRIX_EXPECTED["$expected_key"]:-0} + 1 ))
+
   if ! JS="$(snapshot_json "$ns" "$group" 2>/dev/null)"; then
     GROUP_LINES+=("FAIL  [$ns] $group — cannot list snapshots")
     mark_failure "cannot list [$ns]:$group"
     continue
   fi
+
+  for offset in 0 1 2; do
+    DAY_STATE="$(jq -r --arg day "${DAY_DATES[$offset]}" '
+      [ .[]
+        | {
+            epoch: (."backup-time" // .backup_time // 0),
+            state: ((.verification.state // .verification_state // "missing") | ascii_downcase)
+          }
+        | select(.epoch > 0)
+        | . + {local_day: (.epoch | strflocaltime("%Y-%m-%d"))}
+        | select(.local_day == $day)
+      ] as $snapshots
+      | if ($snapshots | length) == 0 then "missing"
+        elif any($snapshots[]; .state == "ok") then "ok"
+        else "unverified"
+        end' <<<"$JS")"
+
+    if [[ "$DAY_STATE" != "missing" ]]; then
+      found_key="${category}|${ns}|${offset}"
+      MATRIX_FOUND["$found_key"]=$(( ${MATRIX_FOUND["$found_key"]:-0} + 1 ))
+      if [[ "$DAY_STATE" == "ok" ]]; then
+        MATRIX_VERIFIED["$found_key"]=$(( ${MATRIX_VERIFIED["$found_key"]:-0} + 1 ))
+      fi
+    fi
+  done
 
   LATEST="$(jq '[.[] | (."backup-time" // .backup_time // 0)] | max // 0' <<<"$JS")"
   if [[ "$LATEST" -eq 0 ]]; then
@@ -147,6 +262,32 @@ done < <(
       end
     | @tsv' "$EXPECTED_BACKUPS_FILE"
 )
+
+for category in workload hostcfg; do
+  if [[ "$category" == "workload" ]]; then
+    matrix_hosts=("${WORKLOAD_HOSTS[@]}")
+    category_label="workload"
+  else
+    matrix_hosts=("${HOSTCFG_HOSTS[@]}")
+    category_label="host-config"
+  fi
+
+  for ns in "${matrix_hosts[@]}"; do
+    expected="${MATRIX_EXPECTED["${category}|${ns}"]:-0}"
+    for offset in 0 1 2; do
+      found="${MATRIX_FOUND["${category}|${ns}|${offset}"]:-0}"
+      verified="${MATRIX_VERIFIED["${category}|${ns}|${offset}"]:-0}"
+      if (( found < expected )); then
+        mark_warning "${category_label} coverage [$ns] ${DAY_DATES[$offset]}=${found}/${expected}"
+      elif (( verified < expected )); then
+        mark_warning "${category_label} verification [$ns] ${DAY_DATES[$offset]}=${verified}/${expected}"
+      fi
+    done
+  done
+done
+
+WORKLOAD_MATRIX="$(build_matrix workload "${WORKLOAD_HOSTS[@]}")"
+HOSTCFG_MATRIX="$(build_matrix hostcfg "${HOSTCFG_HOSTS[@]}")"
 
 DATASTORE_JSON="$(proxmox-backup-manager datastore show "$PBS_DATASTORE" --output-format json 2>/dev/null || echo '{}')"
 MAINTENANCE_MODE="$(jq -r '.["maintenance-mode"] // .maintenance_mode // "clear"' <<<"$DATASTORE_JSON")"
@@ -209,8 +350,11 @@ else
   mark_failure "could not size S3 mirror within timeout"
 fi
 
+MIRROR_PARITY="FAILED"
 if [[ "$NAS_COUNT" != "unknown" && "$S3_COUNT" != "unknown" ]]; then
-  if [[ "$NAS_COUNT" != "$S3_COUNT" || "$NAS_BYTES" != "$S3_BYTES" ]]; then
+  if [[ "$NAS_COUNT" == "$S3_COUNT" && "$NAS_BYTES" == "$S3_BYTES" ]]; then
+    MIRROR_PARITY="OK"
+  else
     mark_failure "NAS/S3 parity mismatch NAS=${NAS_COUNT}:${NAS_BYTES} S3=${S3_COUNT}:${S3_BYTES}"
   fi
 fi
@@ -227,29 +371,51 @@ fi
 
 GC_JSON="$(proxmox-backup-manager garbage-collection status "$PBS_DATASTORE" --output-format json 2>/dev/null || echo '{}')"
 GC_SUMMARY="$(jq -c '.' <<<"$GC_JSON")"
+GC_UPID="$(jq -r '.upid // empty' <<<"$GC_JSON")"
+GC_REMOVED_BYTES="$(jq -r '.["removed-bytes"] // .removed_bytes // 0' <<<"$GC_JSON")"
+GC_REMOVED_CHUNKS="$(jq -r '.["removed-chunks"] // .removed_chunks // 0' <<<"$GC_JSON")"
+if [[ -n "$GC_UPID" ]]; then
+  GC_SHORT="freed $(human_bytes "$GC_REMOVED_BYTES") / ${GC_REMOVED_CHUNKS} chunks"
+else
+  GC_SHORT="not run yet (scheduled Sunday)"
+fi
+
 PRUNE_JSON="$(proxmox-backup-manager prune-job list --output-format json 2>/dev/null || echo '[]')"
+PRUNE_COUNT="$(jq 'length' <<<"$PRUNE_JSON")"
 
 NEXT_TIMERS="$(systemctl list-timers --all --no-pager \
   pbs-protection-cycle.timer \
   pbs-protection-monthly-verify.timer \
   pbs-protection-daily-report.timer 2>/dev/null || true)"
 
+NAS_HUMAN="$([[ "$NAS_BYTES" =~ ^[0-9]+$ ]] && human_bytes "$NAS_BYTES" || printf unknown)"
+S3_HUMAN="$([[ "$S3_BYTES" =~ ^[0-9]+$ ]] && human_bytes "$S3_BYTES" || printf unknown)"
+
 {
   printf 'PBS DAILY HEALTH REPORT — %s\n' "$OVERALL"
   printf 'Generated: %s\n' "$(date '+%F %T %Z')"
   printf 'Host:      %s\n' "$(hostname -f 2>/dev/null || hostname)"
+  printf 'Store:     %s\n' "$PBS_DATASTORE"
   printf '\n'
-  printf 'PROMOTION\n'
-  printf '  %s\n' "$PROMOTION_SUMMARY"
-  printf '  cycle service: %s\n' "$CYCLE_SERVICE_STATE"
+  printf 'FIRST GLANCE\n'
+  printf '  Overall:    %s\n' "$OVERALL"
+  printf '  Promotion:  %s; elapsed=%s\n' "$PROMOTION_SHORT" "$CYCLE_ELAPSED"
+  printf '  Mirrors:    %s; %s; %s objects\n' "$MIRROR_PARITY" "$NAS_HUMAN" "$NAS_COUNT"
+  printf '  Datastore:  %s used; %s available\n' "$FS_PCT" "$(human_bytes "$FS_AVAIL")"
+  printf '  SMART:      %s; %sC\n' "${SMART_HEALTH:-unknown}" "${SMART_TEMP:-unknown}"
+  printf '  Tasks:      %s failed in 36h\n' "$RECENT_FAILED_TASKS"
   printf '\n'
-  printf 'EXPECTED BACKUPS\n'
+  printf 'WORKLOAD BACKUPS — 3 DAY COVERAGE\n%s\n' "$WORKLOAD_MATRIX"
+  printf '\n'
+  printf 'HOST CONFIG BACKUPS — 3 DAY COVERAGE\n%s\n' "$HOSTCFG_MATRIX"
+  printf '\n'
+  printf 'LATEST EXPECTED BACKUPS\n'
   printf '  %s\n' "${GROUP_LINES[@]}"
   printf '\n'
-  printf 'MIRRORS\n'
-  printf '  NAS: objects=%s bytes=%s (%s)\n' "$NAS_COUNT" "$NAS_BYTES" "$([[ "$NAS_BYTES" =~ ^[0-9]+$ ]] && human_bytes "$NAS_BYTES" || printf unknown)"
-  printf '  S3:  objects=%s bytes=%s (%s)\n' "$S3_COUNT" "$S3_BYTES" "$([[ "$S3_BYTES" =~ ^[0-9]+$ ]] && human_bytes "$S3_BYTES" || printf unknown)"
-  printf '  parity: %s\n' "$([[ "$NAS_COUNT" != unknown && "$NAS_COUNT" == "$S3_COUNT" && "$NAS_BYTES" == "$S3_BYTES" ]] && printf OK || printf FAILED)"
+  printf 'ENDPOINTS\n'
+  printf '  NAS: objects=%s bytes=%s (%s)\n' "$NAS_COUNT" "$NAS_BYTES" "$NAS_HUMAN"
+  printf '  S3:  objects=%s bytes=%s (%s)\n' "$S3_COUNT" "$S3_BYTES" "$S3_HUMAN"
+  printf '  parity: %s\n' "$MIRROR_PARITY"
   printf '\n'
   printf 'DATASTORE\n'
   printf '  path: %s\n' "$PBS_DATASTORE_PATH"
@@ -264,7 +430,8 @@ NEXT_TIMERS="$(systemctl list-timers --all --no-pager \
   printf '\n'
   printf 'MAINTENANCE\n'
   printf '  recent failed PBS tasks (36h): %s\n' "$RECENT_FAILED_TASKS"
-  printf '  GC status: %s\n' "$GC_SUMMARY"
+  printf '  GC: %s\n' "$GC_SHORT"
+  printf '  GC raw: %s\n' "$GC_SUMMARY"
   printf '  prune jobs: %s\n' "$(jq -c '.' <<<"$PRUNE_JSON")"
   printf '\n'
   printf 'TIMERS\n%s\n' "$NEXT_TIMERS"
@@ -286,19 +453,56 @@ find "$REPORT_DIR" -maxdepth 1 -type f -name 'daily-*.txt' -mtime "+$REPORT_KEEP
 
 cat "$REPORT_FILE"
 
-TELEGRAM_GROUPS="$(printf '%s\n' "${GROUP_LINES[@]}" | sed -E 's/ +/ /g' | head -n 20)"
+case "$OVERALL" in
+  HEALTHY) STATUS_ICON='✅' ;;
+  WARNING) STATUS_ICON='⚠️' ;;
+  *) STATUS_ICON='❌' ;;
+esac
+
+[[ "$MIRROR_PARITY" == "OK" ]] && MIRROR_ICON='✅' || MIRROR_ICON='❌'
+[[ "$SMART_HEALTH" =~ (OK|PASSED) ]] && SMART_ICON='✅' || SMART_ICON='❌'
+[[ "$RECENT_FAILED_TASKS" == "0" ]] && TASK_ICON='✅' || TASK_ICON='⚠️'
+
+ISSUE_BLOCK=""
+if ((${#FAILURES[@]} || ${#WARNINGS[@]})); then
+  ISSUE_LINES="$(
+    {
+      printf 'FAIL: %s\n' "${FAILURES[@]}"
+      printf 'WARN: %s\n' "${WARNINGS[@]}"
+    } | sed '/^FAIL: $/d; /^WARN: $/d' | head -n 8
+  )"
+  ISSUE_BLOCK="
+<b>Issues</b>
+<pre>$(html_escape "$ISSUE_LINES")</pre>"
+fi
+
 TELEGRAM_MESSAGE="$(cat <<MSG
-$([[ "$OVERALL" == HEALTHY ]] && printf '✅' || { [[ "$OVERALL" == WARNING ]] && printf '⚠️' || printf '❌'; }) <b>PBS daily report: $(html_escape "$OVERALL")</b>
+${STATUS_ICON} <b>PBS Daily — $(html_escape "$OVERALL")</b>
+🖥 <code>$(html_escape "$(hostname -s)")</code>  🗄 <code>$(html_escape "$PBS_DATASTORE")</code>
 
-Promotion: <code>$(html_escape "$PROMOTION_SUMMARY")</code>
-NAS/S3: <b>$(html_escape "$NAS_COUNT") objects / $(html_escape "$NAS_BYTES") bytes</b>
-Disk: <b>$(html_escape "${SMART_HEALTH:-unknown}")</b>, temp <b>$(html_escape "${SMART_TEMP:-unknown}")C</b>, use <b>$(html_escape "$FS_PCT")</b>
-Failed tasks (36h): <b>$(html_escape "$RECENT_FAILED_TASKS")</b>
+<b>At a glance</b>
+Promotion: ${STATUS_ICON} <b>$(html_escape "$PROMOTION_SHORT")</b>
+Mirrors: ${MIRROR_ICON} <b>$(html_escape "$NAS_HUMAN") / $(html_escape "$NAS_COUNT") objects</b>
+Storage: <b>$(html_escape "$FS_PCT") used</b> · $(html_escape "$(human_bytes "$FS_AVAIL")") free
+Disk: ${SMART_ICON} <b>$(html_escape "${SMART_HEALTH:-unknown}")</b> · $(html_escape "${SMART_TEMP:-unknown}")C
+Tasks: ${TASK_ICON} <b>$(html_escape "$RECENT_FAILED_TASKS") failed</b> · GC $(html_escape "$GC_SHORT")
 
-<pre>$(html_escape "$TELEGRAM_GROUPS")</pre>
+📦 <b>Workload backups</b>
+<pre>$(html_escape "$WORKLOAD_MATRIX")</pre>
+
+🖥 <b>Host config backups</b>
+<pre>$(html_escape "$HOSTCFG_MATRIX")</pre>
+
+🔁 <b>Promotion endpoints</b>
+NAS: ${MIRROR_ICON} $(html_escape "$NAS_HUMAN")
+S3:  ${MIRROR_ICON} $(html_escape "$S3_HUMAN")
+Parity: <b>$(html_escape "$MIRROR_PARITY")</b> · elapsed $(html_escape "$CYCLE_ELAPSED")
+Prune: <b>$(html_escape "$PRUNE_COUNT") job(s)</b>${ISSUE_BLOCK}
+
 Report: <code>$(html_escape "$REPORT_FILE")</code>
 MSG
 )"
+
 notify "$TELEGRAM_MESSAGE"
 
 [[ "$OVERALL" != "FAILED" ]]
